@@ -83,11 +83,19 @@ python3 genbox_batch.py --list-tools
 2. asks which image tool to use (or takes `--tool`),
 3. either loads a saved config profile (`--config`) or asks for the options, with Enter keeping the tool default,
 4. collects images from the folder (`jpg jpeg png webp bmp tif tiff`, plus `mp4 mov m4v` for video-capable tools),
-5. skips files that already have a result in `out/` unless `--overwrite`,
+5. skips files already processed with the same tool and identical content (sha1 stored in the metadata) unless `--overwrite`,
 6. uploads up to `--limit` files (default `5`) one by one, with a delay between requests,
-7. downloads every output into `out/` and writes `out/<file>.<tool>.<job>.json`.
+7. downloads every output into `out/` (by default `<dir>/out`, next to your images) and writes `out/<file>.<tool>.<job>.json`.
 
 Flags: `--dir`, `--out`, `--tool`, `--config`, `--limit`, `--sleep`, `--jitter`, `--recursive`, `--overwrite`, `--yes`, `--dry-run`, `--list-tools`, `--all-tools`, `--api-base`.
+
+## Skipping and re-running
+
+Results land in `<dir>/out` by default, so two different folders never mix. A file
+is skipped only when the metadata of a previous run for the same stem **and** the
+same tool has the same sha1, that is the file content did not change. To force a
+re-run use `--overwrite`; the script prints how many files it found and how many
+it skipped, so "Nothing to process" always tells you why.
 
 ## Config profiles
 

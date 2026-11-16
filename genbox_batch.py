@@ -22,6 +22,7 @@ License: MIT
 """
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -190,8 +191,29 @@ def collect_files(folder, recursive, videos):
             if p.is_file() and p.suffix.lower() in exts]
 
 
-def already_done(path, out_dir):
-    return any(out_dir.glob(f"{path.stem}*"))
+def file_sha1(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def already_done(path, sha1, out_dir, tool_slug):
+    """Done = a metadata file for this stem + tool exists with the same content hash.
+
+    Files processed by older versions (no sha1 stored) are treated as done only
+    when the stem matches, so nothing is silently re-uploaded twice.
+    """
+    for meta in out_dir.glob(f"{path.stem}.{tool_slug}.*.json"):
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+        except Exception:
+            return True
+        stored = data.get("source_sha1")
+        if stored is None or stored == sha1:
+            return True
+    return False
 
 
 def sleep_between(base, jitter, first=False):
@@ -268,6 +290,7 @@ def process_one(session, api_base, tool, path, out_dir, params):
 
     meta = {
         "source": path.name,
+        "source_sha1": file_sha1(path),
         "tool": tool["slug"],
         "job": job,
         "params": params,
@@ -285,7 +308,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Batch image processing with the free tools at genbox.eu")
     ap.add_argument("--dir", default=".", help="folder with images (default: current)")
-    ap.add_argument("--out", default="out", help="output folder (default: out)")
+    ap.add_argument("--out", help="output folder (default: <dir>/out)")
     ap.add_argument("--tool", help="tool slug: signature-remover, upscale-image, image-enhancer")
     ap.add_argument("--config", help="GenBox config profile: local JSON file, URL or job id")
     ap.add_argument("--limit", type=int, default=5, help="max files per run (default: 5, 0 = all)")
@@ -330,18 +353,35 @@ def main():
     if not params:
         params = build_params(tool, interactive=not args.yes)
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path(args.out) if args.out else Path(args.dir) / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     has_video = any("video/" in str(i.get("accept", "")) for i in tool.get("inputs", []))
-    files = collect_files(args.dir, args.recursive, has_video)
+    found = collect_files(args.dir, args.recursive, has_video)
+    skipped = []
     if not args.overwrite:
-        files = [f for f in files if not already_done(f, out_dir)]
+        for f in found:
+            if already_done(f, file_sha1(f), out_dir, tool["slug"]):
+                skipped.append(f)
+        files = [f for f in found if f not in skipped]
+    else:
+        files = list(found)
     if args.limit and args.limit > 0:
         files = files[: args.limit]
 
+    log("")
+    log(f"Found {len(found)} file(s) in {Path(args.dir).resolve()}")
+    if skipped:
+        log(f"Skipped {len(skipped)} already processed with {tool['slug']} "
+            f"(use --overwrite to redo them)")
+
     if not files:
-        log("Nothing to process.")
+        if found:
+            log("Nothing to process: every file already has a result for this tool.")
+        else:
+            log("Nothing to process: no images found. "
+                "Supported types: " + ", ".join(sorted(IMAGE_EXT)) +
+                ". Use --recursive to include subfolders.")
         return
 
     log("")
