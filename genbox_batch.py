@@ -2,15 +2,19 @@
 """
 genbox_batch.py - batch-process a folder of images with GenBox (genbox.eu).
 
-Checks a directory for images, sends them to one GenBox tool of your choice
-(AI Signature Remover, Upscale Image, Image Enhancer, ...), waits between
-requests so the free queue does not answer with HTTP 429, and stores every
-result in ./out/ next to a JSON file with the job metadata.
+Picks one image tool (AI Signature Remover, Upscale Image or Image Enhancer),
+sends every image from a folder one by one, keeps a delay between requests so
+the free queue does not answer with HTTP 429, and stores all results in ./out/
+together with a JSON file per job.
+
+A GenBox config profile (the JSON GenBox saves for each job) can be passed with
+--config, either as a local file, a URL or a bare job id; the script then reuses
+those exact settings instead of asking for them.
 
 Usage:
-    python3 genbox_batch.py                    # interactive, current folder
-    python3 genbox_batch.py --dir photos/      # another folder
-    python3 genbox_batch.py --tool upscale-image --limit 5
+    python3 genbox_batch.py
+    python3 genbox_batch.py --dir photos --tool upscale-image
+    python3 genbox_batch.py --dir photos --tool upscale-image --config profile.json
     python3 genbox_batch.py --list-tools
 
 Requirements: Python 3.8+, requests (pip install -r requirements.txt)
@@ -19,7 +23,6 @@ License: MIT
 
 import argparse
 import json
-import os
 import random
 import sys
 import time
@@ -28,111 +31,174 @@ from pathlib import Path
 try:
     import requests
 except ImportError:
-    sys.exit("Brak biblioteki requests. Zainstaluj: pip install -r requirements.txt")
+    sys.exit("Missing dependency: requests. Install it with: pip install -r requirements.txt")
 
 API_BASE = "https://genbox.eu"
+UA = "genbox-batch/1.1 (+https://genbox.eu)"
+
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v"}
-UA = "genbox-batch/1.0 (+https://genbox.eu)"
+
+# Tools that make sense for a folder of images.
+IMAGE_TOOLS = (
+    "signature-remover",
+    "upscale-image",
+    "image-enhancer",
+)
 
 
 def log(msg=""):
     print(msg, flush=True)
 
 
-def fetch_tools(session, api_base):
-    r = session.get(f"{api_base}/api/tools", timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return [t for t in data.get("tools", []) if t.get("enabled", True)]
-
-
 def ask(prompt, default=""):
     suffix = f" [{default}]" if default != "" else ""
-    val = input(f"{prompt}{suffix}: ").strip()
-    return val if val else default
+    try:
+        value = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return value if value else default
 
 
-def build_params(tool, non_interactive=False):
-    """Ask the user for the tool options, keep the tool defaults otherwise."""
+def ask_yes(prompt, default=True):
+    hint = "Y/n" if default else "y/N"
+    value = ask(f"{prompt} ({hint})", "y" if default else "n").lower()
+    return value.startswith("y")
+
+
+def fetch_tools(session, api_base):
+    resp = session.get(f"{api_base}/api/tools", timeout=30)
+    resp.raise_for_status()
+    tools = [t for t in resp.json().get("tools", []) if t.get("enabled", True)]
+    return tools
+
+
+def option_values(inp):
+    """Return (values, labels) for select/tags inputs."""
+    options = inp.get("options") or []
+    if options and isinstance(options[0], dict):
+        values = [o.get("value") for o in options]
+        labels = [str(o.get("label", o.get("value"))) for o in options]
+    else:
+        values = list(options)
+        labels = [str(o) for o in options]
+    return values, labels
+
+
+def build_params(tool, interactive=True):
+    """Collect the tool options. With interactive=False every default is kept."""
     params = {}
     inputs = [i for i in tool.get("inputs", []) if i.get("type") != "file"]
-    if non_interactive or not inputs:
+    if not inputs:
         return params
 
-    log("")
-    log(f"Opcje narzędzia {tool['name']} (Enter = wartość domyślna):")
+    if interactive:
+        log("")
+        log(f"Options for {tool['name']} (press Enter to keep the default):")
+
     for inp in inputs:
         name = inp.get("name")
         label = inp.get("label", name)
         typ = inp.get("type")
         default = inp.get("default", "")
 
-        if typ == "select":
-            options = inp.get("options") or []
-            if options and isinstance(options[0], dict):
-                values = [o.get("value") for o in options]
-                labels = [o.get("label", o.get("value")) for o in options]
+        if typ in ("select", "tags"):
+            values, labels = option_values(inp)
+            if not values:
+                continue
+            default_idx = 1
+            for idx, val in enumerate(values, 1):
+                if str(val) == str(default):
+                    default_idx = idx
+
+            if interactive:
+                log(f"  {label}:")
+                for idx, lab in enumerate(labels, 1):
+                    mark = " (default)" if idx == default_idx else ""
+                    log(f"    {idx}. {lab}{mark}")
+                pick = ask(f"  choice 1-{len(values)}", str(default_idx))
             else:
-                values = list(options)
-                labels = list(options)
-            log(f"  {label}:")
-            for idx, lab in enumerate(labels, 1):
-                mark = " (domyślnie)" if str(values[idx - 1]) == str(default) else ""
-                log(f"    {idx}. {lab}{mark}")
-            pick = ask(f"  wybór 1-{len(labels)}", "")
+                pick = str(default_idx)
+
             if pick.isdigit() and 1 <= int(pick) <= len(values):
                 params[name] = values[int(pick) - 1]
             elif pick:
-                params[name] = pick  # accept raw value too
+                params[name] = pick
+
         elif typ == "checkbox":
-            cur = "tak" if default else "nie"
-            pick = ask(f"  {label} (tak/nie)", cur).lower()
-            params[name] = "true" if pick.startswith("t") else ""
+            current = "yes" if default else "no"
+            if interactive:
+                pick = ask(f"  {label}", current).lower()
+            else:
+                pick = current
+            params[name] = "true" if pick.startswith("y") else ""
+
         elif typ in ("range", "number"):
-            hint = f"{inp.get('min', '')}..{inp.get('max', '')}".strip(".")
-            pick = ask(f"  {label} {hint}", str(default))
+            hint = ""
+            if inp.get("min") is not None and inp.get("max") is not None:
+                hint = f" ({inp['min']}..{inp['max']})"
+            if interactive:
+                pick = ask(f"  {label}{hint}", str(default))
+            else:
+                pick = str(default)
             if pick != "":
                 params[name] = pick
-        else:
-            continue
+
     return params
 
 
-def pick_tool(tools):
+def pick_tool(tools, show_all=False):
+    visible = [t for t in tools if t["slug"] in IMAGE_TOOLS] if not show_all else tools
+    if not visible:
+        visible = tools
     log("")
-    log("Dostępne narzędzia GenBox:")
-    for idx, tool in enumerate(tools, 1):
-        cat = tool.get("category", "")
-        log(f"  {idx:2d}. {tool['name']}  [{tool['slug']}]  ({cat})")
+    log("Available image tools:")
+    for idx, tool in enumerate(visible, 1):
+        log(f"  {idx}. {tool['name']}  [{tool['slug']}]")
     while True:
-        pick = ask("Wybierz numer narzędzia", "1")
-        if pick.isdigit() and 1 <= int(pick) <= len(tools):
-            return tools[int(pick) - 1]
-        log("  Nieprawidłowy wybór.")
+        pick = ask("Pick a tool", "1")
+        if pick.isdigit() and 1 <= int(pick) <= len(visible):
+            return visible[int(pick) - 1]
+        log("  Invalid choice.")
+
+
+def load_profile(source, tool_slug=None, api_base=API_BASE, session=None):
+    """Load a GenBox config profile: local file, URL or bare job id."""
+    if source.startswith("http://") or source.startswith("https://"):
+        getter = session.get if session else requests.get
+        resp = getter(source, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    path = Path(source)
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    if not tool_slug:
+        raise SystemExit("--config with a job id needs --tool <slug> as well")
+    url = f"{api_base}/config/{source}/genbox-config-{tool_slug}.json"
+    getter = session.get if session else requests.get
+    resp = getter(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def collect_files(folder, recursive, videos):
     exts = IMAGE_EXT | (VIDEO_EXT if videos else set())
     pattern = "**/*" if recursive else "*"
-    files = [p for p in sorted(Path(folder).glob(pattern))
-             if p.is_file() and p.suffix.lower() in exts]
-    return files
+    return [p for p in sorted(Path(folder).glob(pattern))
+            if p.is_file() and p.suffix.lower() in exts]
 
 
 def already_done(path, out_dir):
-    """Treat a file as done when anything with its stem already sits in out/."""
-    stem = path.stem
-    for existing in out_dir.glob(f"{stem}*"):
-        return True
-    return False
+    return any(out_dir.glob(f"{path.stem}*"))
 
 
 def sleep_between(base, jitter, first=False):
     if first:
         return
     delay = base + random.uniform(0, max(jitter, 0))
-    log(f"  ... czekam {delay:.1f}s (limit darmowej kolejki)")
+    log(f"  ... waiting {delay:.1f}s (free queue limit)")
     time.sleep(delay)
 
 
@@ -146,7 +212,7 @@ def post_job(session, api_base, tool, path, params, retries=4):
                 files = {"image": (path.name, fh)}
                 resp = session.post(url, files=files, data=params, timeout=300)
         except requests.RequestException as exc:
-            log(f"  ! błąd sieci: {exc}")
+            log(f"  ! network error: {exc}")
             if attempt > retries:
                 raise
             time.sleep(5 * attempt)
@@ -156,12 +222,12 @@ def post_job(session, api_base, tool, path, params, retries=4):
             return resp.json()
 
         if resp.status_code == 429:
-            wait = resp.headers.get("Retry-After")
-            wait = float(wait) if wait and wait.replace(".", "", 1).isdigit() else 15 * attempt
+            header = resp.headers.get("Retry-After")
+            wait = float(header) if header and header.replace(".", "", 1).isdigit() else 15 * attempt
             body = resp.text[:200].replace("\n", " ")
-            log(f"  ! 429 rate limit (próba {attempt}/{retries}), czekam {wait:.0f}s")
+            log(f"  ! 429 rate limited (attempt {attempt}/{retries}), sleeping {wait:.0f}s")
             if attempt > retries:
-                raise RuntimeError(f"429 po {retries} próbach: {body}")
+                raise RuntimeError(f"429 after {retries} attempts: {body}")
             time.sleep(wait)
             continue
 
@@ -171,16 +237,16 @@ def post_job(session, api_base, tool, path, params, retries=4):
 def download(session, url, target, retries=3):
     for attempt in range(1, retries + 1):
         try:
-            with session.get(url, stream=True, timeout=300) as r:
-                r.raise_for_status()
+            with session.get(url, stream=True, timeout=300) as resp:
+                resp.raise_for_status()
                 with open(target, "wb") as fh:
-                    for chunk in r.iter_content(1 << 16):
+                    for chunk in resp.iter_content(1 << 16):
                         fh.write(chunk)
             return target.stat().st_size
         except requests.RequestException as exc:
             if attempt == retries:
                 raise
-            log(f"  ! pobieranie nie udało się ({exc}), ponawiam")
+            log(f"  ! download failed ({exc}), retrying")
             time.sleep(3 * attempt)
 
 
@@ -190,9 +256,9 @@ def process_one(session, api_base, tool, path, out_dir, params):
     job = data.get("job", "job")
     written = []
 
-    for out in data.get("outputs", []):
-        url = out.get("url")
-        name = out.get("name") or f"{path.stem}-{job}{path.suffix}"
+    for item in data.get("outputs", []):
+        url = item.get("url")
+        name = item.get("name") or f"{path.stem}-{job}{path.suffix}"
         if not url:
             continue
         target = out_dir / name
@@ -216,17 +282,21 @@ def process_one(session, api_base, tool, path, out_dir, params):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch image processing via genbox.eu")
+    ap = argparse.ArgumentParser(
+        description="Batch image processing with the free tools at genbox.eu")
     ap.add_argument("--dir", default=".", help="folder with images (default: current)")
     ap.add_argument("--out", default="out", help="output folder (default: out)")
-    ap.add_argument("--tool", help="tool slug, e.g. upscale-image (skips the menu)")
+    ap.add_argument("--tool", help="tool slug: signature-remover, upscale-image, image-enhancer")
+    ap.add_argument("--config", help="GenBox config profile: local JSON file, URL or job id")
     ap.add_argument("--limit", type=int, default=5, help="max files per run (default: 5, 0 = all)")
     ap.add_argument("--sleep", type=float, default=8.0, help="base delay between files in s (default: 8)")
     ap.add_argument("--jitter", type=float, default=3.0, help="random extra delay in s (default: 3)")
     ap.add_argument("--recursive", action="store_true", help="walk subfolders")
-    ap.add_argument("--overwrite", action="store_true", help="process files already present in out/")
-    ap.add_argument("--dry-run", action="store_true", help="show the plan, send nothing")
+    ap.add_argument("--overwrite", action="store_true", help="process files that already have output")
+    ap.add_argument("--yes", action="store_true", help="keep every default, ask nothing")
+    ap.add_argument("--dry-run", action="store_true", help="show the plan, upload nothing")
     ap.add_argument("--list-tools", action="store_true", help="list tools and exit")
+    ap.add_argument("--all-tools", action="store_true", help="show every GenBox tool, not only image tools")
     ap.add_argument("--api-base", default=API_BASE, help=f"API base (default: {API_BASE})")
     args = ap.parse_args()
 
@@ -236,39 +306,50 @@ def main():
     tools = fetch_tools(session, args.api_base)
     if args.list_tools:
         for tool in tools:
-            log(f"{tool['slug']:26s} {tool['name']}")
+            mark = "*" if tool["slug"] in IMAGE_TOOLS else " "
+            log(f"{mark} {tool['slug']:26s} {tool['name']}")
+        log("")
+        log("* = image tool offered in the menu (use --all-tools to show the rest)")
         return
 
     if args.tool:
         tool = next((t for t in tools if t["slug"] == args.tool), None)
         if not tool:
-            sys.exit(f"Nieznane narzędzie: {args.tool}. Sprawdź --list-tools")
+            sys.exit(f"Unknown tool: {args.tool}. Run --list-tools to see the slugs.")
     else:
-        tool = pick_tool(tools)
+        tool = pick_tool(tools, show_all=args.all_tools)
 
-    params = build_params(tool, non_interactive=False)
+    params = {}
+    if args.config:
+        profile = load_profile(args.config, tool["slug"], args.api_base, session)
+        params = {k: v for k, v in profile.items()
+                  if not k.startswith("_") and k != "image"}
+        log(f"Loaded config profile: {args.config}")
+        if params:
+            log("  " + json.dumps(params, ensure_ascii=False))
+    if not params:
+        params = build_params(tool, interactive=not args.yes)
 
     out_dir = Path(args.out)
     out_dir.mkdir(exist_ok=True)
 
-    videos = "video" in tool["slug"] or any(
-        "video/mp4" in str(i.get("accept")) for i in tool.get("inputs", []))
-    files = collect_files(args.dir, args.recursive, videos)
+    has_video = any("video/" in str(i.get("accept", "")) for i in tool.get("inputs", []))
+    files = collect_files(args.dir, args.recursive, has_video)
     if not args.overwrite:
         files = [f for f in files if not already_done(f, out_dir)]
     if args.limit and args.limit > 0:
         files = files[: args.limit]
 
     if not files:
-        log("Brak plików do przetworzenia.")
+        log("Nothing to process.")
         return
 
     log("")
-    log(f"Narzędzie: {tool['name']} ({tool['slug']})")
-    log(f"Pliki ({len(files)}): {', '.join(f.name for f in files)}")
-    log(f"Wyniki: {out_dir.resolve()}")
+    log(f"Tool: {tool['name']} ({tool['slug']})")
+    log(f"Files ({len(files)}): {', '.join(f.name for f in files)}")
+    log(f"Output: {out_dir.resolve()}")
     if args.dry_run:
-        log("DRY RUN - nic nie wysyłam.")
+        log("DRY RUN - nothing uploaded.")
         return
 
     ok = 0
@@ -281,11 +362,11 @@ def main():
             log(f"  ! {path.name}: {exc}")
 
     log("")
-    log(f"Gotowe: {ok}/{len(files)} plików. Wyniki w {out_dir.resolve()}")
+    log(f"Done: {ok}/{len(files)} files. Results in {out_dir.resolve()}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("\nPrzerwane.")
+        log("\nInterrupted.")
